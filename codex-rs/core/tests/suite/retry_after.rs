@@ -2,6 +2,7 @@ use anyhow::Result;
 use codex_client::RetryOn;
 use codex_client::RetryPolicy;
 use codex_client::run_with_retry;
+use codex_features::Feature;
 use codex_http_client::Request;
 use codex_http_client::TransportError;
 use codex_login::CodexAuth;
@@ -36,11 +37,8 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 
 const FIRST_RETRY_MIN_DELAY: Duration = Duration::from_millis(180);
 const FIRST_RETRY_MAX_DELAY: Duration = Duration::from_millis(220);
@@ -346,72 +344,135 @@ async fn http_retry_backoff_exhausts_attempts() {
     );
 }
 
-/// Headerless HTTP overloads currently exhaust request retries before emitting one terminal error.
+/// Headerless HTTP overloads use the persistent network backoff after request retries are exhausted.
 #[tokio::test(flavor = "current_thread")]
-async fn responses_http_overload_without_retry_after_exhausts_request_retries() -> Result<()> {
+async fn responses_http_overload_without_retry_after_uses_persistent_backoff() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let mut telemetry = RetryTelemetryCapture::install();
     let server = responses::start_mock_server().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
+    let response_mock = responses::mount_response_sequence(
+        &server,
+        vec![
             ResponseTemplate::new(503)
                 .set_body_json(json!({ "error": { "code": "server_is_overloaded" } })),
-        )
-        .mount(&server)
-        .await;
+            ResponseTemplate::new(503)
+                .set_body_json(json!({ "error": { "code": "server_is_overloaded" } })),
+            ResponseTemplate::new(503)
+                .set_body_json(json!({ "error": { "code": "server_is_overloaded" } })),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ])),
+        ],
+    )
+    .await;
     let test = test_codex()
         .with_config(|config| {
             config.model_provider.request_max_retries = Some(2);
-            config.model_provider.stream_max_retries = Some(2);
+            config.model_provider.stream_max_retries = Some(0);
         })
         .build_with_auto_env(&server)
         .await?;
 
-    submit_user_input(&test, "reject the disabled model").await?;
-    let mut error_events = 0;
-    let mut stream_error_events = 0;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match wait_for_event(&test.codex, |_| true).await {
-                EventMsg::Error(error) => {
-                    error_events += 1;
-                    assert_eq!(
-                        error.codex_error_info,
-                        Some(CodexErrorInfo::ServerOverloaded)
-                    );
-                    assert_eq!(
-                        error.message,
-                        "Selected model is at capacity. Please try a different model."
-                    );
-                }
-                EventMsg::StreamError(_) => stream_error_events += 1,
-                EventMsg::TurnComplete(event) => {
-                    assert_eq!(
-                        event.error.and_then(|error| error.codex_error_info),
-                        Some(CodexErrorInfo::ServerOverloaded)
-                    );
-                    break;
-                }
-                _ => {}
-            }
+    submit_user_input(&test, "recover from the overloaded model").await?;
+    let first_retry = telemetry.next_retry().await;
+    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&first_retry.delay));
+    wait_for_retry(&mut telemetry, &first_retry).await;
+    let second_retry = telemetry.next_retry().await;
+    assert!((SECOND_RETRY_MIN_DELAY..SECOND_RETRY_MAX_DELAY).contains(&second_retry.delay));
+    wait_for_retry(&mut telemetry, &second_retry).await;
+    let persistent_retry = telemetry.next_retry().await;
+    assert_eq!(
+        persistent_retry,
+        RetryTelemetryEvent {
+            attempt: 1,
+            delay: Duration::from_secs(5),
+            layer: "stream".into(),
+            operation: "sampling".into(),
         }
+    );
+    wait_for_retry(&mut telemetry, &persistent_retry).await;
+    wait_for_turn_completion(&test).await;
+
+    assert_eq!(response_mock.requests().len(), 4);
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+
+    Ok(())
+}
+
+/// ChatGPT model availability errors are transient even though the service reports HTTP 400.
+#[tokio::test(flavor = "current_thread")]
+async fn chatgpt_model_not_supported_uses_persistent_backoff() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut telemetry = RetryTelemetryCapture::install();
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(400).set_body_json(json!({
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "The 'gpt-test' model is not supported when using Codex with a ChatGPT account."
+                }
+            })),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ])),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    submit_user_input(&test, "retry the transient ChatGPT model error").await?;
+    let retry = telemetry.next_retry().await;
+    assert_eq!(
+        retry,
+        RetryTelemetryEvent {
+            attempt: 1,
+            delay: Duration::from_secs(5),
+            layer: "stream".into(),
+            operation: "sampling".into(),
+        }
+    );
+    let EventMsg::StreamError(stream_error) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::StreamError(_))
     })
     .await
-    .expect("overload retries should finish the turn within 10 seconds");
-
-    assert_eq!(error_events, 1);
-    assert_eq!(stream_error_events, 0);
-    let request_count = server
-        .received_requests()
-        .await
-        .expect("mock server should record requests")
-        .into_iter()
-        .filter(|request| request.url.path() == "/v1/responses")
-        .count();
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
     assert_eq!(
-        request_count, 3,
-        "headerless overload should exhaust the configured request retries"
+        stream_error.message,
+        "Selected model is temporarily unavailable for this ChatGPT account. Retrying with backoff"
+    );
+    assert!(
+        stream_error
+            .additional_details
+            .as_deref()
+            .is_some_and(|details| details
+                .contains("model is not supported when using Codex with a ChatGPT account."))
+    );
+    wait_for_retry(&mut telemetry, &retry).await;
+    wait_for_turn_completion(&test).await;
+
+    assert_eq!(response_mock.requests().len(), 2);
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
     );
 
     Ok(())
@@ -1176,72 +1237,67 @@ async fn sse_rate_limit_message_with_retry_after_uses_server_advised_retry_delay
     Ok(())
 }
 
-// TODO(anp) respect Retry-After
-/// A streamed backend overload remains terminal despite an enclosing retry header.
+/// A streamed backend overload uses the persistent network backoff despite a retry header.
 #[tokio::test(flavor = "current_thread")]
-async fn sse_overload_with_retry_after_is_terminal() -> Result<()> {
+async fn sse_overload_with_retry_after_uses_persistent_backoff() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let mut telemetry = RetryTelemetryCapture::install();
     let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_response_once(
+    let response_mock = responses::mount_response_sequence(
         &server,
-        responses::sse_response(responses::sse_failed(
-            "disabled-model",
-            "server_is_overloaded",
-            "This model is disabled.",
-        ))
-        .insert_header("Retry-After", "1"),
+        vec![
+            responses::sse_response(responses::sse_failed(
+                "overloaded-model",
+                "server_is_overloaded",
+                "This model is overloaded.",
+            ))
+            .insert_header("Retry-After", "1"),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ])),
+        ],
     )
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_provider.request_max_retries = Some(2);
-            config.model_provider.stream_max_retries = Some(2);
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
         })
         .build_with_auto_env(&server)
         .await?;
 
-    submit_user_input(&test, "reject the streamed overload despite retry advice").await?;
-
-    let mut error_events = 0;
-    let mut stream_error_events = 0;
-    loop {
-        match wait_for_event(&test.codex, |_| true).await {
-            EventMsg::Error(error) => {
-                error_events += 1;
-                assert_eq!(
-                    error.codex_error_info,
-                    Some(CodexErrorInfo::ServerOverloaded)
-                );
-                assert_eq!(
-                    error.message,
-                    "Selected model is at capacity. Please try a different model."
-                );
-            }
-            EventMsg::StreamError(_) => stream_error_events += 1,
-            EventMsg::TurnComplete(event) => {
-                assert_eq!(
-                    event.error.and_then(|error| error.codex_error_info),
-                    Some(CodexErrorInfo::ServerOverloaded)
-                );
-                break;
-            }
-            _ => {}
+    submit_user_input(&test, "retry the streamed overload").await?;
+    let retry = telemetry.next_retry().await;
+    assert_eq!(
+        retry,
+        RetryTelemetryEvent {
+            attempt: 1,
+            delay: Duration::from_secs(5),
+            layer: "stream".into(),
+            operation: "sampling".into(),
         }
-    }
+    );
+    let EventMsg::StreamError(stream_error) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::StreamError(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(
+        stream_error.message,
+        "Selected model is at capacity. Retrying with backoff"
+    );
+    assert_eq!(
+        stream_error.additional_details.as_deref(),
+        Some("Selected model is at capacity. Please try a different model.")
+    );
+    wait_for_retry(&mut telemetry, &retry).await;
+    wait_for_turn_completion(&test).await;
 
-    assert_eq!(error_events, 1);
-    assert_eq!(stream_error_events, 0);
-    assert_eq!(response_mock.requests().len(), 1);
-    let request_count = server
-        .received_requests()
-        .await
-        .expect("mock server should record requests")
-        .into_iter()
-        .filter(|request| request.url.path() == "/v1/responses")
-        .count();
-    assert_eq!(request_count, 1, "streamed overload must not retry");
+    assert_eq!(response_mock.requests().len(), 2);
     assert_eq!(
         telemetry.events.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -1250,70 +1306,51 @@ async fn sse_overload_with_retry_after_is_terminal() -> Result<()> {
     Ok(())
 }
 
-/// A streamed backend overload without retry advice must complete with one terminal error.
+/// Streamed overloads share the network retry counter and exponential backoff.
 #[tokio::test(flavor = "current_thread")]
-async fn sse_overload_without_retry_after_is_terminal() -> Result<()> {
+async fn sse_overload_without_retry_after_uses_network_backoff_sequence() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let mut telemetry = RetryTelemetryCapture::install();
     let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_sse_once(
+    let response_mock = responses::mount_response_sequence(
         &server,
-        responses::sse_failed(
-            "disabled-model",
-            "server_is_overloaded",
-            "This model is disabled.",
-        ),
+        vec![
+            responses::sse_response(responses::sse_failed(
+                "overloaded-1",
+                "server_is_overloaded",
+                "This model is overloaded.",
+            )),
+            responses::sse_response(responses::sse_failed(
+                "overloaded-2",
+                "server_is_overloaded",
+                "This model is overloaded.",
+            )),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ])),
+        ],
     )
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_provider.request_max_retries = Some(2);
-            config.model_provider.stream_max_retries = Some(2);
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
         })
         .build_with_auto_env(&server)
         .await?;
 
-    submit_user_input(&test, "reject the streamed overload").await?;
+    submit_user_input(&test, "recover after repeated model overloads").await?;
+    let first_retry = telemetry.next_retry().await;
+    assert_eq!(first_retry.delay, Duration::from_secs(5));
+    wait_for_retry(&mut telemetry, &first_retry).await;
+    let second_retry = telemetry.next_retry().await;
+    assert_eq!(second_retry.delay, Duration::from_secs(10));
+    wait_for_retry(&mut telemetry, &second_retry).await;
+    wait_for_turn_completion(&test).await;
 
-    let mut error_events = 0;
-    let mut stream_error_events = 0;
-    loop {
-        match wait_for_event(&test.codex, |_| true).await {
-            EventMsg::Error(error) => {
-                error_events += 1;
-                assert_eq!(
-                    error.codex_error_info,
-                    Some(CodexErrorInfo::ServerOverloaded)
-                );
-                assert_eq!(
-                    error.message,
-                    "Selected model is at capacity. Please try a different model."
-                );
-            }
-            EventMsg::StreamError(_) => stream_error_events += 1,
-            EventMsg::TurnComplete(event) => {
-                assert_eq!(
-                    event.error.and_then(|error| error.codex_error_info),
-                    Some(CodexErrorInfo::ServerOverloaded)
-                );
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    assert_eq!(error_events, 1);
-    assert_eq!(stream_error_events, 0);
-    assert_eq!(response_mock.requests().len(), 1);
-    let request_count = server
-        .received_requests()
-        .await
-        .expect("mock server should record requests")
-        .into_iter()
-        .filter(|request| request.url.path() == "/v1/responses")
-        .count();
-    assert_eq!(request_count, 1, "headerless SSE overload must not retry");
+    assert_eq!(response_mock.requests().len(), 3);
     assert_eq!(
         telemetry.events.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -1605,9 +1642,9 @@ async fn websocket_rate_limit_without_retry_after_is_terminal() -> Result<()> {
 }
 
 // TODO(anp) respect Retry-After
-/// Websocket overloads remain terminal despite a nested retry header.
+/// Websocket overloads remain terminal when persistent retries are disabled.
 #[tokio::test(flavor = "current_thread")]
-async fn websocket_overload_with_nested_retry_after_is_terminal() -> Result<()> {
+async fn websocket_overload_with_nested_retry_after_is_terminal_when_disabled() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let mut telemetry = RetryTelemetryCapture::install();
@@ -1632,6 +1669,7 @@ async fn websocket_overload_with_nested_retry_after_is_terminal() -> Result<()> 
             // Capture inference retries without unrelated startup model-discovery retries.
             config.model_catalog =
                 Some(bundled_models_response().expect("bundled models.json should parse"));
+            let _ = config.features.disable(Feature::UnboundedConnectionRetries);
             config.model_provider.request_max_retries = Some(2);
             config.model_provider.stream_max_retries = Some(2);
         })
@@ -1690,9 +1728,9 @@ async fn websocket_overload_with_nested_retry_after_is_terminal() -> Result<()> 
     Ok(())
 }
 
-/// Headerless websocket overloads must neither reconnect nor fall back to HTTP.
+/// Headerless websocket overloads remain terminal when persistent retries are disabled.
 #[tokio::test(flavor = "current_thread")]
-async fn websocket_overload_without_retry_after_is_terminal() -> Result<()> {
+async fn websocket_overload_without_retry_after_is_terminal_when_disabled() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let mut telemetry = RetryTelemetryCapture::install();
@@ -1716,6 +1754,7 @@ async fn websocket_overload_without_retry_after_is_terminal() -> Result<()> {
             // Capture inference retries without unrelated startup model-discovery retries.
             config.model_catalog =
                 Some(bundled_models_response().expect("bundled models.json should parse"));
+            let _ = config.features.disable(Feature::UnboundedConnectionRetries);
             config.model_provider.request_max_retries = Some(2);
             config.model_provider.stream_max_retries = Some(2);
         })
