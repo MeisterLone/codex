@@ -118,7 +118,9 @@ impl ChatWidget {
             return;
         }
         #[cfg(any(target_os = "windows", test))]
-        if self.elevated_windows_sandbox_setup_required() {
+        if self.windows_sandbox_host == crate::app::WindowsSandboxHost::Local
+            && self.elevated_windows_sandbox_setup_required()
+        {
             return;
         }
         if let Some(draft) = pending_draft.take() {
@@ -136,7 +138,18 @@ impl ChatWidget {
             return;
         }
         #[cfg(any(target_os = "windows", test))]
-        if self.elevated_windows_sandbox_setup_required() {
+        if self.windows_sandbox_host == crate::app::WindowsSandboxHost::Local
+            && self.elevated_windows_sandbox_setup_required()
+        {
+            return;
+        }
+        #[cfg(any(target_os = "windows", test))]
+        if self.windows_sandbox_host == crate::app::WindowsSandboxHost::Mixed
+            && self.elevated_windows_sandbox_setup_required()
+        {
+            if let Some(user_message) = self.initial_user_message.take() {
+                self.restore_user_message_to_composer(user_message);
+            }
             return;
         }
         if self.blocks_direct_input {
@@ -271,6 +284,7 @@ impl ChatWidget {
     /// When there are queued user messages, restore them into the composer
     /// separated by newlines rather than auto-submitting the next one.
     pub(super) fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
+        self.requeue_image_submission();
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();
         let send_pending_steers_immediately =
@@ -489,6 +503,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn capture_thread_input_state(&mut self) -> Option<ThreadInputState> {
+        self.cancel_image_submission();
         let draft = self.bottom_pane.composer_draft_snapshot();
         let composer = ThreadComposerState {
             text: draft.text,

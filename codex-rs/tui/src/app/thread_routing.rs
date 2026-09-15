@@ -908,6 +908,7 @@ impl App {
                 let name = name.to_string();
                 app_server.thread_set_name(thread_id, name.clone()).await?;
                 self.chat_widget.expect_manual_thread_name(thread_id, name);
+                self.cancel_thread_title_generation(thread_id);
                 Ok(true)
             }
             AppCommand::Review { target } => {
@@ -1813,6 +1814,10 @@ impl App {
             replay_filter::snapshot_has_pending_interactive_request(&snapshot);
         self.chat_widget
             .set_queue_autosend_suppressed(/*suppressed*/ true);
+        let has_resumed_collaboration_mode = snapshot
+            .session
+            .as_ref()
+            .is_some_and(|session| session.collaboration_mode.is_some());
         if let Some(session) = snapshot.session {
             if session.reasoning_effort != Some(ReasoningEffortConfig::Ultra) {
                 self.chat_widget
@@ -1866,7 +1871,12 @@ impl App {
                 .send(AppEvent::EndInitialHistoryReplayBuffer);
         }
         if recovered_input.is_some() {
+            let mode = has_resumed_collaboration_mode
+                .then(|| self.chat_widget.effective_collaboration_mode());
             self.chat_widget.restore_reconnected_input(recovered_input);
+            if let Some(mode) = mode {
+                self.chat_widget.set_effective_collaboration_mode(mode);
+            }
         }
         self.restore_realtime_replay_state_after_replay(
             &replayed_final_items,
