@@ -478,6 +478,77 @@ async fn chatgpt_model_not_supported_uses_persistent_backoff() -> Result<()> {
     Ok(())
 }
 
+/// Cyber policy responses can be transient and should not terminate an active turn.
+#[tokio::test(flavor = "current_thread")]
+async fn cyber_policy_response_uses_persistent_backoff() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut telemetry = RetryTelemetryCapture::install();
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_response_sequence(
+        &server,
+        vec![
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": "This request has been flagged for potentially high-risk cyber activity.",
+                    "type": "invalid_request",
+                    "param": null,
+                    "code": "cyber_policy"
+                }
+            })),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ])),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    submit_user_input(&test, "retry the transient cyber policy response").await?;
+    let retry = telemetry.next_retry().await;
+    assert_eq!(
+        retry,
+        RetryTelemetryEvent {
+            attempt: 1,
+            delay: Duration::from_secs(5),
+            layer: "stream".into(),
+            operation: "sampling".into(),
+        }
+    );
+    let EventMsg::StreamError(stream_error) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::StreamError(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(
+        stream_error.message,
+        "Request was temporarily blocked by cybersecurity policy. Retrying with backoff"
+    );
+    assert_eq!(
+        stream_error.additional_details.as_deref(),
+        Some("This request has been flagged for potentially high-risk cyber activity.")
+    );
+    wait_for_retry(&mut telemetry, &retry).await;
+    wait_for_turn_completion(&test).await;
+
+    assert_eq!(response_mock.requests().len(), 2);
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+
+    Ok(())
+}
+
 // TODO(anp) respect Retry-After
 /// Remote compaction v2 currently retries with local backoff instead of the upstream header delay.
 #[tokio::test(flavor = "current_thread")]

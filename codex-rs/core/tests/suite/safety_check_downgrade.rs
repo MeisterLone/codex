@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_core::TurnInputRequest;
+use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -120,7 +121,11 @@ async fn cyber_policy_response_emits_typed_error_without_retry() -> Result<()> {
     }));
     let mock = mount_response_once(&server, response).await;
 
-    let mut builder = test_codex().with_model(REQUESTED_MODEL);
+    let mut builder = test_codex()
+        .with_model(REQUESTED_MODEL)
+        .with_config(|config| {
+            let _ = config.features.disable(Feature::UnboundedConnectionRetries);
+        });
     let test = builder.build(&server).await?;
 
     test.codex

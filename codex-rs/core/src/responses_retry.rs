@@ -68,7 +68,9 @@ pub(crate) fn uses_unbounded_response_retries(
         && matches!(request, ResponsesStreamRequest::Sampling)
         && (matches!(
             err.details(),
-            CodexErrorDetails::ConnectionFailed(_) | CodexErrorDetails::ServerOverloaded
+            CodexErrorDetails::ConnectionFailed(_)
+                | CodexErrorDetails::ServerOverloaded
+                | CodexErrorDetails::CyberPolicy { .. }
         ) || is_transient_chatgpt_model_error(err))
         && !turn_context.session_source.is_internal()
         && !turn_context.provider.info().is_amazon_bedrock()
@@ -96,6 +98,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
         let retry_delay = retry_state.unbounded_retry_delay;
         let retry_status = if matches!(err.details(), CodexErrorDetails::ServerOverloaded) {
             "Selected model is at capacity. Retrying with backoff"
+        } else if matches!(err.details(), CodexErrorDetails::CyberPolicy { .. }) {
+            "Request was temporarily blocked by cybersecurity policy. Retrying with backoff"
         } else if is_transient_chatgpt_model_error(&err) {
             "Selected model is temporarily unavailable for this ChatGPT account. Retrying with backoff"
         } else {
