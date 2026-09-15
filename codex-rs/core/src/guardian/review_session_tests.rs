@@ -4,7 +4,6 @@ use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::context_manager::ContextManager;
 use codex_guardian_reviewer::ReviewerRequest;
-use codex_guardian_reviewer::ReviewerSession;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::openai_models::AutoReviewMessages;
@@ -34,10 +33,11 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
         .await;
     let mut params = test_review_params().await;
     params.spawn_config = build_guardian_review_session_config(
-        turn.config.as_ref(),
+        crate::guardian::test_host::build_reviewer_config(turn.config.as_ref())
+            .expect("reviewer config"),
         /*live_network_config*/ None,
-        &params.model,
-        params.reasoning_effort.clone(),
+        &params.review_model.model,
+        params.review_model.reasoning_effort.clone(),
         params.reasoning_summary,
         params.personality,
         /*model_messages*/ None,
@@ -208,7 +208,8 @@ async fn test_review_params() -> GuardianReviewSessionParams {
     #[allow(deprecated)]
     let cwd = turn.cwd.clone();
     let spawn_config = build_guardian_review_session_config(
-        turn.config.as_ref(),
+        crate::guardian::test_host::build_reviewer_config(turn.config.as_ref())
+            .expect("reviewer config"),
         /*live_network_config*/ None,
         model.as_str(),
         reasoning_effort.clone(),
@@ -237,13 +238,15 @@ async fn test_review_params() -> GuardianReviewSessionParams {
         },
         reasons: ApprovalRequestReasons::default(),
         schema: super::super::guardian_output_schema(),
-        model,
+        review_model: ReviewModel {
+            model,
+            reasoning_effort,
+            default_review_model_id: "codex-auto-review".to_string(),
+            catalog_contains_auto_review: true,
+            model_overridden: false,
+            model_override: None,
+        },
         compaction_model_hash: None,
-        reasoning_effort,
-        guardian_default_review_model_id: "codex-auto-review".to_string(),
-        guardian_catalog_contains_auto_review: true,
-        guardian_review_model_overridden: false,
-        guardian_review_model_override: None,
         reasoning_summary,
         personality,
         external_cancel: None,
@@ -299,14 +302,14 @@ async fn spawned_guardian_reuse_key_matches_inherited_instructions() {
 
     assert_eq!(review.reuse_key, expected_key);
     assert_eq!(review.session.inherited_instructions().await.thread, latest);
-    review.shutdown().await;
+    manager.shutdown().await;
 }
 
 #[tokio::test]
 async fn guardian_review_session_config_change_invalidates_cached_session() {
     let parent_config = crate::config::test_config().await;
     let cached_spawn_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -326,7 +329,8 @@ async fn guardian_review_session_config_change_invalidates_cached_session() {
     changed_parent_config.model_provider.base_url =
         Some("https://guardian.example.invalid/v1".to_string());
     let next_spawn_config = build_guardian_review_session_config(
-        &changed_parent_config,
+        crate::guardian::test_host::build_reviewer_config(&changed_parent_config)
+            .expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -516,7 +520,7 @@ async fn guardian_prompt_cache_key_is_scoped_to_parent_thread() {
 async fn guardian_review_session_compact_scope_change_invalidates_cached_session() {
     let parent_config = crate::config::test_config().await;
     let cached_spawn_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -536,7 +540,8 @@ async fn guardian_review_session_compact_scope_change_invalidates_cached_session
     changed_parent_config.model_auto_compact_token_limit_scope =
         AutoCompactTokenLimitScope::BodyAfterPrefix;
     let next_spawn_config = build_guardian_review_session_config(
-        &changed_parent_config,
+        crate::guardian::test_host::build_reviewer_config(&changed_parent_config)
+            .expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -564,7 +569,7 @@ async fn guardian_review_session_config_disables_hooks() {
         .expect("enable hooks on parent config");
 
     let guardian_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -583,7 +588,7 @@ async fn guardian_review_session_config_disables_skill_instructions() {
     parent_config.include_skill_instructions = true;
 
     let guardian_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -626,7 +631,7 @@ async fn guardian_review_session_config_prefers_configured_policy_and_template()
     };
 
     let guardian_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -670,7 +675,7 @@ async fn guardian_review_session_config_preserves_explicit_empty_catalog_policy(
     };
 
     let guardian_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -722,7 +727,7 @@ async fn guardian_review_session_config_preserves_explicit_empty_catalog_templat
     };
 
     let guardian_config = build_guardian_review_session_config(
-        &parent_config,
+        crate::guardian::test_host::build_reviewer_config(&parent_config).expect("reviewer config"),
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
@@ -1152,10 +1157,18 @@ async fn prewarm_test_session(
 ) -> GuardianReviewSessionManager {
     let key = session.reuse_key.clone();
     let session = Arc::new(Mutex::new(Some(session)));
-    let pool = GuardianReviewSessionManager::new(move |_, _, _, _, _| {
-        let session = Arc::clone(&session);
-        Box::pin(async move { Ok(session.lock().await.take().expect("one fixture spawn")) })
-    });
+    let pool = GuardianReviewSessionManager::new(
+        Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
+        move |_, _, _, _, _| {
+            let session = Arc::clone(&session);
+            Box::pin(async move { Ok(session.lock().await.take().expect("one fixture spawn")) })
+        },
+    );
+    params.parent_session.services.thread_extension_data.insert(
+        codex_guardian_reviewer::ReviewerConfig::<Config>(
+            crate::guardian::test_host::build_reviewer_config,
+        ),
+    );
     let context = setup::prepare_prewarm(
         Arc::clone(&params.parent_session),
         Arc::clone(params.parent_context.turn()),
