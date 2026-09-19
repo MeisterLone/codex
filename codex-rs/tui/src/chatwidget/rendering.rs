@@ -99,19 +99,16 @@ impl ExternalWriterNotice {
         } else {
             quit_keys.insert(/*index*/ 0, escape);
         }
-        items.push((quit_keys.join("/").replace(" + ", "+"), "exit".to_string()));
+        items.push((quit_keys.join("/"), "exit".to_string()));
         if let Some(hint) = self.transcript_hint {
-            items.push((
-                hint.display_label().replace(" + ", "+"),
-                "transcript".to_string(),
-            ));
+            items.push((hint.display_label(), "transcript".to_string()));
         }
         let mut spans = vec![" ".set_style(crate::style::footer_hint_label_style())];
         for (idx, (key, label)) in items.into_iter().enumerate() {
             if idx > 0 {
                 spans.push("   ".set_style(crate::style::footer_hint_label_style()));
             }
-            spans.push(key.set_style(crate::style::footer_hint_key_style()));
+            spans.extend(crate::key_hint::key_label_spans(&key));
             spans.push(format!(" {label}").set_style(crate::style::footer_hint_label_style()));
         }
         word_wrap_lines(&[Line::from(spans)], usize::from(width))
@@ -174,17 +171,7 @@ impl ChatWidget {
                 })),
             );
         }
-        if let Some(cell) = self.pending_token_activity_output() {
-            flex.push(
-                /*flex*/ 1,
-                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
-                    child: cell,
-                    top: 1,
-                    right: active_cell_right_reserve,
-                    persistent_layout: None,
-                })),
-            );
-        }
+
         if let Some(cell) = self.pending_rate_limit_reset_hint() {
             flex.push(
                 /*flex*/ 1,

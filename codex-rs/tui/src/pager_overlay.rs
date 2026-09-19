@@ -58,6 +58,7 @@ use scrolling::render_offset_content;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    Analytics(Box<crate::analytics::AnalyticsView>),
 }
 
 impl Overlay {
@@ -85,6 +86,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::Analytics(o) => o.handle_event(tui, event),
         }
     }
 
@@ -92,6 +94,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::Analytics(o) => o.is_done,
         }
     }
 }
@@ -114,9 +117,9 @@ fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(Vec<ShortcutHint>, &
         }
         for (i, key) in keys.iter().enumerate() {
             if i > 0 {
-                spans.push("/".into());
+                spans.extend(crate::key_hint::key_label_spans("/"));
             }
-            spans.push(Span::from(*key));
+            spans.extend(key.spans());
         }
         spans.push(" ".into());
         spans.push(Span::from(desc.to_string()));

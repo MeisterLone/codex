@@ -64,8 +64,6 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::SandboxMode;
-#[cfg(target_os = "windows")]
-use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_rollout::StateDbHandle;
 use codex_rollout::state_db;
 use codex_state::log_db;
@@ -102,11 +100,6 @@ pub(crate) use codex_app_server_client::legacy_core;
 pub(crate) use worktree_startup::ManagedTuiWorktree;
 
 mod additional_dirs;
-// Removed when the final stack layer connects Analytics to /usage.
-#[expect(
-    dead_code,
-    reason = "analytics is being introduced in independently tested stack layers"
-)]
 mod analytics;
 mod app;
 mod app_backtrack;
@@ -119,6 +112,7 @@ mod app_server_connection;
 mod app_server_session;
 mod approval_events;
 mod ascii_animation;
+mod async_question_reply;
 mod backend_banners;
 mod bottom_pane;
 mod branch_summary;
@@ -191,7 +185,7 @@ pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
 mod resume_picker;
-mod selection_list;
+mod screen_reader;
 mod service_tier_resolution;
 mod session_archive_commands;
 mod session_log;
@@ -223,6 +217,7 @@ mod theme_picker;
 mod thread_color;
 mod thread_transcript;
 mod token_usage;
+mod tool_output;
 mod tooltips;
 mod transcript_reflow;
 mod tui;
@@ -230,6 +225,7 @@ mod ui_consts;
 mod unarchive_prompt;
 pub(crate) mod update_action;
 mod worktree_startup;
+pub use update_action::DaemonUpdateSource;
 pub use update_action::UpdateAction;
 #[cfg(not(debug_assertions))]
 pub use update_action::get_update_action;
@@ -241,7 +237,6 @@ mod updates_cache;
 mod version;
 mod vim_search;
 mod width;
-#[cfg(any(target_os = "windows", test))]
 mod windows_sandbox;
 mod workspace_command;
 mod workspace_messages;
@@ -305,8 +300,13 @@ async fn start_embedded_app_server(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AppServerTarget {
     Embedded,
-    LocalDaemon { endpoint: RemoteAppServerEndpoint },
-    Remote { endpoint: RemoteAppServerEndpoint },
+    LocalDaemon {
+        endpoint: RemoteAppServerEndpoint,
+        allow_embedded_fallback: bool,
+    },
+    Remote {
+        endpoint: RemoteAppServerEndpoint,
+    },
 }
 
 impl AppServerTarget {
@@ -523,10 +523,24 @@ async fn start_app_server(
     if let Some(connection) = connection {
         match connection {
             Ok(app_server) => return Ok(app_server),
-            Err(err) if matches!(target, AppServerTarget::LocalDaemon { .. }) => {
+            Err(err)
+                if matches!(
+                    target,
+                    AppServerTarget::LocalDaemon {
+                        allow_embedded_fallback: true,
+                        ..
+                    }
+                ) =>
+            {
                 tracing::debug!(%err, "local daemon connection failed; starting embedded app server");
                 *target = AppServerTarget::Embedded;
                 *state_db = init_state_db_for_app_server_target(&config, target).await?;
+            }
+            Err(err) if matches!(target, AppServerTarget::LocalDaemon { .. }) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "{err:#}\n{}",
+                    daemon_startup::FAILURE_HINT
+                ));
             }
             Err(err) => return Err(err),
         }
@@ -954,6 +968,7 @@ fn app_server_target_for_launch(
         None if can_reuse_implicit_local_daemon && exec_server_url.is_none() => {
             default_daemon_socket.map_or(AppServerTarget::Embedded, |socket_path| {
                 AppServerTarget::LocalDaemon {
+                    allow_embedded_fallback: true,
                     endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
                 }
             })
@@ -991,19 +1006,6 @@ fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
     let loader_overrides_are_default =
         loader_overrides_are_default && loader_overrides.managed_preferences_base64.is_none();
     loader_overrides_are_default
-}
-
-fn can_reuse_implicit_local_daemon(
-    cli_kv_overrides: &[(String, toml::Value)],
-    loader_overrides: &LoaderOverrides,
-    strict_config: bool,
-    has_non_replayable_launch_overrides: bool,
-) -> bool {
-    // A reused daemon cannot adopt this invocation's full launch config state.
-    cli_kv_overrides.is_empty()
-        && loader_overrides_are_default(loader_overrides)
-        && !strict_config
-        && !has_non_replayable_launch_overrides
 }
 
 /// Restore terminal modes before a fatal startup exit bypasses destructor cleanup.
@@ -1059,6 +1061,8 @@ async fn run_ratatui_app(
     mut state_db: Option<StateDbHandle>,
     environment_manager: Arc<EnvironmentManager>,
     managed_worktree: Option<ManagedTuiWorktree>,
+    daemon_startup_warning: Option<String>,
+    launch_telemetry: daemon_telemetry::Launch<impl FnOnce(&AppServerTarget, bool)>,
     startup_draft: startup_draft::StartupDraft,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
@@ -1124,6 +1128,7 @@ async fn run_ratatui_app(
             ),
         )
         .await;
+    launch_telemetry.record(&app_server_target, matches!(&startup_app_server, Ok(Ok(_))));
     let app_server_session = match startup_app_server {
         Ok(Ok(app_server)) => {
             AppServerSession::new(app_server, app_server_target.thread_params_mode())
@@ -1816,20 +1821,7 @@ async fn run_ratatui_app(
     set_default_client_residency_requirement(config.enforce_residency.value());
     let should_show_trust_screen = should_show_trust_screen(&config);
     #[cfg(target_os = "windows")]
-    let windows_sandbox_level = crate::windows_sandbox::level_from_config(&config);
-    #[cfg(target_os = "windows")]
-    let required_elevated_sandbox_needs_setup = windows_sandbox_level
-        == WindowsSandboxLevel::Elevated
-        && config
-            .config_layer_stack
-            .requirements()
-            .windows_sandbox_mode
-            .source
-            .is_some();
-    #[cfg(target_os = "windows")]
-    let should_prompt_windows_sandbox_nux_at_startup = (trust_decision_was_made
-        && windows_sandbox_level == WindowsSandboxLevel::Disabled)
-        || required_elevated_sandbox_needs_setup;
+    let should_prompt_windows_sandbox_nux_at_startup = trust_decision_was_made;
     #[cfg(not(target_os = "windows"))]
     let should_prompt_windows_sandbox_nux_at_startup = false;
 
@@ -1837,6 +1829,7 @@ async fn run_ratatui_app(
         prompt,
         shared,
         no_alt_screen,
+        daemon_cli_executable,
         ..
     } = cli;
     let images = shared.into_inner().images;
@@ -1927,8 +1920,10 @@ async fn run_ratatui_app(
         startup_elapsed_before_app,
         startup_bootstrap,
         startup_hooks_browser,
+        daemon_startup_warning,
         startup_draft,
         managed_worktree,
+        daemon_cli_executable,
     ))
     .await;
 
@@ -2192,6 +2187,9 @@ fn should_show_bedrock_setup_wizard(
             .is_login_method_allowed(ForcedLoginMethod::Api)
 }
 
+mod daemon_startup;
+mod daemon_telemetry;
+
 #[cfg(test)]
 #[path = "daemon_startup_tests.rs"]
 mod daemon_startup_tests;
@@ -2319,6 +2317,7 @@ requires_openai_auth = {requires_openai_auth}
                 enabled,
                 LoginStatus::NotAuthenticated,
                 AppServerTarget::LocalDaemon {
+                    allow_embedded_fallback: true,
                     endpoint: shared_endpoint.clone(),
                 },
                 false,
@@ -2939,6 +2938,7 @@ requires_openai_auth = {requires_openai_auth}
         assert_eq!(
             target,
             AppServerTarget::LocalDaemon {
+                allow_embedded_fallback: true,
                 endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
             }
         );
@@ -3038,47 +3038,9 @@ requires_openai_auth = {requires_openai_auth}
     }
 
     #[test]
-    fn can_reuse_implicit_local_daemon_requires_default_launch_config() -> color_eyre::Result<()> {
-        let mut loader_overrides = LoaderOverrides::default();
-        let cli_kv_overrides = vec![("web_search".to_string(), toml::Value::String("live".into()))];
-
-        assert!(can_reuse_implicit_local_daemon(
-            &[],
-            &LoaderOverrides::default(),
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        assert!(!can_reuse_implicit_local_daemon(
-            &cli_kv_overrides,
-            &LoaderOverrides::default(),
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        loader_overrides.ignore_user_config = true;
-        assert!(!can_reuse_implicit_local_daemon(
-            &[],
-            &loader_overrides,
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        assert!(!can_reuse_implicit_local_daemon(
-            &[],
-            &LoaderOverrides::default(),
-            /*strict_config*/ true,
-            /*has_non_replayable_launch_overrides*/ false,
-        ));
-        assert!(!can_reuse_implicit_local_daemon(
-            &[],
-            &LoaderOverrides::default(),
-            /*strict_config*/ false,
-            /*has_non_replayable_launch_overrides*/ true,
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn should_load_configured_environments_for_local_daemon() -> color_eyre::Result<()> {
         let target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
             },
@@ -3136,6 +3098,7 @@ requires_openai_auth = {requires_openai_auth}
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
         let target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
             },
@@ -3472,6 +3435,7 @@ requires_openai_auth = {requires_openai_auth}
     -> std::io::Result<()> {
         let temp_dir = TempDir::new()?;
         let target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
             },
@@ -3548,6 +3512,7 @@ requires_openai_auth = {requires_openai_auth}
             &environment_manager
         ));
         let local_daemon = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
             },

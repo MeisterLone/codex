@@ -5,7 +5,6 @@ use std::time::Duration;
 use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::util::backoff;
 use codex_client::RetryOperation;
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
@@ -76,9 +75,9 @@ pub(crate) fn uses_unbounded_response_retries(
         && !turn_context.provider.info().is_amazon_bedrock()
 }
 
-/// Handles a retryable stream error and returns `Ok(())` when the caller should
-/// retry the request loop.
-pub(crate) async fn handle_retryable_response_stream_error(
+/// Returns `Ok(())` when the caller should retry the request loop, or the original error when
+/// it is terminal or the retry budget is exhausted.
+pub(crate) async fn handle_response_stream_error(
     retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
     err: CodexErr,
@@ -91,7 +90,6 @@ pub(crate) async fn handle_retryable_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
-
     if uses_unbounded_response_retries(turn_context, request, &err) {
         // Deliberately bypass `max_retries`: keep retrying until sampling succeeds or
         // the caller cancels the turn. Only the delay is capped, not the attempt count.
@@ -121,6 +119,12 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Ok(());
     }
 
+    let retry_count = retry_state.retries.saturating_add(1);
+    let Some(delay) = err.retry_delay(retry_count) else {
+        return Err(err);
+    };
+
+    // TODO(anp): Respect server retry advice before issuing the fallback HTTP request.
     if retry_state.retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
@@ -139,9 +143,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     }
 
     if retry_state.retries < max_retries {
-        retry_state.retries += 1;
-        let retry_count = retry_state.retries;
-        let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));
+        retry_state.retries = retry_count;
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
         // In release builds, hide the first websocket retry notification to reduce noisy
@@ -169,7 +171,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         .insert(ExhaustedResponseRetry {
             turn_id: turn_context.sub_id.clone(),
             retry_at: err
-                .retry_delay()
+                .server_retry_delay()
                 .and_then(|delay| tokio::time::Instant::now().checked_add(delay)),
         });
     Err(err)

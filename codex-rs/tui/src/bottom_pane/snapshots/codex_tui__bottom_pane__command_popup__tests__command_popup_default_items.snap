@@ -1,5 +1,6 @@
 ---
 source: tui/src/bottom_pane/command_popup.rs
+assertion_line: 523
 expression: commands
 ---
 /model - choose what model and reasoning effort to use
@@ -32,6 +33,7 @@ expression: commands
 /diff - show git diff (including untracked files)
 /mention - mention a file
 /status - show current session configuration and token usage
+/daemon - Manage the local background server.
 /cd - change the current working directory
 /pwd - show the current working directory
 /title - configure which items appear in the terminal title

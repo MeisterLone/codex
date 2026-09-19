@@ -4022,7 +4022,10 @@ async fn terminal_title_model_updates_on_model_change_without_manual_refresh() {
     chat.local_settings.tui.terminal_title = Some(vec!["model".to_string()]);
     chat.refresh_terminal_title();
 
-    assert_eq!(chat.last_terminal_title, Some("gpt-5.4".to_string()));
+    assert_chatwidget_snapshot!(
+        "terminal_title_model_display_name",
+        chat.last_terminal_title.as_deref().expect("terminal title")
+    );
 
     chat.set_model("gpt-5.2");
 
@@ -4321,6 +4324,7 @@ async fn session_configured_clears_goal_status_footer() {
 
     let rollout_file = NamedTempFile::new().unwrap();
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -5805,16 +5809,14 @@ printf 'fenced within fenced\n'
 
     // Finalize the stream without sending a final AgentMessage, to flush any tail.
     handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
-    for lines in drain_insert_history(&mut rx) {
+    for lines in drain_insert_history_normalized(&mut rx) {
         crate::insert_history::insert_history_lines(&mut term, lines)
             .expect("Failed to insert history lines in test");
     }
 
     assert_chatwidget_snapshot!(
         "chatwidget_markdown_code_blocks_vt100_snapshot",
-        normalize_completion_timestamps(normalize_snapshot_paths(
-            term.backend().vt100().screen().contents()
-        ))
+        normalize_snapshot_paths(term.backend().vt100().screen().contents())
     );
 }
 
