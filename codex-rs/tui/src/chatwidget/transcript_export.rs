@@ -5,24 +5,6 @@ use crate::app_event::TranscriptExportDestination;
 use crate::bottom_pane::popup_consts::picker_hint_line_for_keymap;
 
 impl ChatWidget {
-    pub(crate) fn copy_transcript_to_clipboard(&mut self, markdown: &str) {
-        match crate::clipboard_copy::copy_to_clipboard(
-            markdown,
-            crate::clipboard_copy::CopyFormat::PlainText,
-        ) {
-            Ok(lease) => {
-                if let Some(lease) = lease {
-                    self.clipboard_lease = Some(lease);
-                }
-                self.add_info_message(
-                    "Copied conversation to clipboard".to_string(),
-                    /*hint*/ None,
-                );
-            }
-            Err(error) => self.add_error_message(format!("Copy failed: {error}")),
-        }
-    }
-
     pub(super) fn show_transcript_export_popup(&mut self) {
         self.show_selection_view(SelectionViewParams {
             header: Box::new(

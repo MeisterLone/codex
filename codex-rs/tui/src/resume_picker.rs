@@ -6,14 +6,12 @@ use std::sync::Arc;
 
 use crate::app_server_session::AppServerSession;
 use crate::clipboard_paste::normalize_pasted_search_query;
+use crate::clock_format::ClockFormat;
 use crate::color::blend;
 use crate::color::is_light;
 use crate::key_hint::KeyBindingListExt;
 use crate::key_hint::is_plain_text_key_event;
 use crate::keymap::ListAction;
-use crate::keymap::ListKeymap;
-use crate::keymap::PagerKeymap;
-use crate::keymap::RuntimeChordKeymap;
 use crate::keymap::RuntimeKeymap;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::edit::ConfigEditsBuilder;
@@ -337,6 +335,7 @@ struct SessionPickerViewPersistence {
 
 struct SessionPickerRunOptions {
     use_theme_colors: bool,
+    copy_on_select: bool,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
@@ -346,10 +345,8 @@ struct SessionPickerRunOptions {
     provider_filter: ProviderFilter,
     initial_density: SessionListDensity,
     view_persistence: Option<SessionPickerViewPersistence>,
-    pager_keymap: PagerKeymap,
-    list_keymap: ListKeymap,
+    keymap: RuntimeKeymap,
     initial_page_mode: PageLoadMode,
-    chord_keymap: Arc<RuntimeChordKeymap>,
 }
 
 /// Interactive session picker that lists app-server threads with simple search,
@@ -449,6 +446,7 @@ async fn run_resume_picker_with_launch_context(
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
+        copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -462,14 +460,12 @@ async fn run_resume_picker_with_launch_context(
         view_persistence: Some(SessionPickerViewPersistence {
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
-        pager_keymap: runtime_keymap.pager,
-        list_keymap: runtime_keymap.list,
+        keymap: runtime_keymap,
         initial_page_mode: if uses_remote_workspace {
             PageLoadMode::StoreDefault
         } else {
             PageLoadMode::StateDbOnly
         },
-        chord_keymap: runtime_keymap.chords,
     };
     run_session_picker_with_loader(
         tui,
@@ -510,6 +506,7 @@ pub async fn run_fork_picker_with_app_server(
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
     let options = SessionPickerRunOptions {
         use_theme_colors: local_settings.tui.status_line_use_colors,
+        copy_on_select: local_settings.copy_on_select(&codex_terminal_detection::terminal_info()),
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -523,14 +520,12 @@ pub async fn run_fork_picker_with_app_server(
         view_persistence: Some(SessionPickerViewPersistence {
             codex_home: local_settings.codex_home.to_path_buf(),
         }),
-        pager_keymap: runtime_keymap.pager,
-        list_keymap: runtime_keymap.list,
+        keymap: runtime_keymap,
         initial_page_mode: if uses_remote_workspace {
             PageLoadMode::StoreDefault
         } else {
             PageLoadMode::StateDbOnly
         },
-        chord_keymap: runtime_keymap.chords,
     };
     run_session_picker_with_loader(
         tui,
@@ -566,12 +561,11 @@ async fn run_session_picker_with_loader(
     );
     state.local_filter_cwd = options.local_filter_cwd;
     state.use_theme_colors = options.use_theme_colors;
+    state.copy_on_select = options.copy_on_select;
     state.worktrees_enabled = options.worktrees_enabled;
     state.density = options.initial_density;
     state.view_persistence = options.view_persistence;
-    state.pager_keymap = options.pager_keymap;
-    state.list_keymap = options.list_keymap;
-    state.chord_keymap = options.chord_keymap;
+    state.keymap = options.keymap;
     state.launch_context = options.launch_context;
     state.initial_page_mode = options.initial_page_mode;
     state.start_initial_load();
@@ -592,6 +586,7 @@ async fn run_session_picker_with_loader(
     loop {
         tokio::select! {
             Some(ev) = tui_events.next() => {
+                alt.tui.clipboard.poll();
                 let screen_size = alt.tui.screen_size_for_event(&ev)?;
                 let ev = if let TuiEvent::Key(key) = ev {
                     let Some(key) = state.route_key_chord(key) else {
@@ -628,7 +623,7 @@ async fn run_session_picker_with_loader(
                             state.open_pending_transcript_if_ready();
                         }
                     }
-                    TuiEvent::FocusLost => {}
+                    TuiEvent::FocusLost | TuiEvent::Mouse(_) => {}
                 }
             }
             Some(event) = background_events.next() => {
@@ -835,7 +830,9 @@ impl Drop for AltScreenGuard<'_> {
 }
 
 struct PickerState {
+    clock_format: ClockFormat,
     use_theme_colors: bool,
+    copy_on_select: bool,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
     requester: FrameRequester,
@@ -877,10 +874,8 @@ struct PickerState {
     pending_transcript_cancellation: Option<oneshot::Sender<()>>,
     transcript_loading_frame_shown: bool,
     overlay: Option<Overlay>,
-    pager_keymap: PagerKeymap,
-    list_keymap: ListKeymap,
+    keymap: RuntimeKeymap,
     initial_page_mode: PageLoadMode,
-    chord_keymap: Arc<RuntimeChordKeymap>,
     chord_matcher: crate::keymap::KeyChordMatcher,
 }
 
@@ -1036,7 +1031,9 @@ impl PickerState {
         action: SessionPickerAction,
     ) -> Self {
         Self {
+            clock_format: ClockFormat::system(),
             use_theme_colors: true,
+            copy_on_select: false,
             requester,
             relative_time_reference: None,
             pagination: PaginationState::new(),
@@ -1077,25 +1074,30 @@ impl PickerState {
             pending_transcript_cancellation: None,
             transcript_loading_frame_shown: false,
             overlay: None,
-            pager_keymap: RuntimeKeymap::defaults().pager,
-            list_keymap: RuntimeKeymap::defaults().list,
+            keymap: RuntimeKeymap::defaults(),
             initial_page_mode: PageLoadMode::StoreDefault,
-            chord_keymap: Arc::default(),
             chord_matcher: crate::keymap::KeyChordMatcher::default(),
         }
     }
 
     fn route_key_chord(&mut self, key: KeyEvent) -> Option<KeyEvent> {
-        let context = if self.overlay.is_some() {
+        if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.owns_interaction_key(key))
+        {
+            self.chord_matcher.cancel();
+            return Some(key);
+        }
+        let context = if matches!(&self.overlay, Some(Overlay::Transcript(overlay)) if overlay.is_search_active())
+        {
+            crate::keymap::KeymapContext::Editor
+        } else if self.overlay.is_some() {
             crate::keymap::KeymapContext::Pager
         } else {
             crate::keymap::KeymapContext::List
         };
         match self.chord_matcher.advance(
             key,
-            &self.chord_keymap,
+            &self.keymap.chords,
             crate::keymap::KeymapContextSet::new(context),
-            tokio::time::Instant::now(),
         ) {
             crate::keymap::KeyChordMatch::PassThrough => Some(key),
             crate::keymap::KeyChordMatch::Completed(dispatch_event) => Some(dispatch_event),
@@ -1133,10 +1135,15 @@ impl PickerState {
         else {
             return;
         };
-        self.overlay = Some(Overlay::new_transcript(
+        let mut overlay = Overlay::new_transcript(
             cells.clone(),
-            self.pager_keymap.clone(),
-        ));
+            self.keymap.pager.clone(),
+            self.copy_on_select,
+        );
+        if let Overlay::Transcript(view) = &mut overlay {
+            view.set_keymap_bindings(&self.keymap);
+        }
+        self.overlay = Some(overlay);
         self.pending_transcript_open = None;
         self.transcript_loading_frame_shown = false;
         self.request_frame();
@@ -1198,7 +1205,7 @@ impl PickerState {
                 modifiers,
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => Some(SessionSelection::Exit),
-            key if self.list_keymap.cancel.is_pressed(key) => {
+            key if self.keymap.list.cancel.is_pressed(key) => {
                 if let Some(thread_id) = self.pending_transcript_open.take()
                     && matches!(
                         self.transcript_cells.get(&thread_id),
@@ -1223,7 +1230,7 @@ impl PickerState {
         if self.is_transcript_loading() {
             return Ok(self.handle_transcript_loading_key(key));
         }
-        if !self.list_keymap.page_down.is_pressed(key) {
+        if !self.keymap.list.page_down.is_pressed(key) {
             self.pending_page_down_target = None;
         }
         // The session picker is always searchable, so plain text belongs to
@@ -1238,7 +1245,7 @@ impl PickerState {
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Some(SessionSelection::Exit));
             }
-            _ if self.list_keymap.cancel.is_pressed(key) => {
+            _ if self.keymap.list.cancel.is_pressed(key) => {
                 if self.query.is_empty() {
                     return Ok(Some(SessionSelection::StartFresh));
                 }
@@ -1286,9 +1293,9 @@ impl PickerState {
             } /* ^O */ => {
                 self.toggle_density().await;
             }
-            _ if self.list_keymap.accept.is_pressed(key)
+            _ if self.keymap.list.accept.is_pressed(key)
                 && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
-            _ if self.list_keymap.accept.is_pressed(key) => {
+            _ if self.keymap.list.accept.is_pressed(key) => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
                     let path = row.path.clone();
                     if let Some(thread_id) = row.thread_id {
@@ -1314,14 +1321,14 @@ impl PickerState {
                     self.request_frame();
                 }
             }
-            _ if allow_plain_char_navigation && self.list_keymap.move_up.is_pressed(key) => {
+            _ if allow_plain_char_navigation && self.keymap.list.move_up.is_pressed(key) => {
                 if self.selected > 0 {
                     self.selected -= 1;
                     self.ensure_selected_visible();
                 }
                 self.request_frame();
             }
-            _ if allow_plain_char_navigation && self.list_keymap.move_down.is_pressed(key) => {
+            _ if allow_plain_char_navigation && self.keymap.list.move_down.is_pressed(key) => {
                 if self.selected + 1 < self.filtered_rows.len() {
                     self.selected += 1;
                     self.ensure_selected_visible();
@@ -1329,7 +1336,7 @@ impl PickerState {
                 self.maybe_load_more_for_scroll();
                 self.request_frame();
             }
-            _ if allow_plain_char_navigation && self.list_keymap.page_up.is_pressed(key) => {
+            _ if allow_plain_char_navigation && self.keymap.list.page_up.is_pressed(key) => {
                 let step = self.view_rows.unwrap_or(10).max(1);
                 if self.selected > 0 {
                     self.selected = self.selected.saturating_sub(step);
@@ -1337,20 +1344,20 @@ impl PickerState {
                     self.request_frame();
                 }
             }
-            _ if allow_plain_char_navigation && self.list_keymap.jump_top.is_pressed(key)
+            _ if allow_plain_char_navigation && self.keymap.list.jump_top.is_pressed(key)
                 && !self.filtered_rows.is_empty() => {
                     self.selected = 0;
                     self.ensure_selected_visible();
                     self.request_frame();
                 }
-            _ if allow_plain_char_navigation && self.list_keymap.jump_bottom.is_pressed(key)
+            _ if allow_plain_char_navigation && self.keymap.list.jump_bottom.is_pressed(key)
                 && !self.filtered_rows.is_empty() => {
                     self.selected = self.filtered_rows.len().saturating_sub(1);
                     self.ensure_selected_visible();
                     self.maybe_load_more_for_scroll();
                     self.request_frame();
                 }
-            _ if allow_plain_char_navigation && self.list_keymap.page_down.is_pressed(key)
+            _ if allow_plain_char_navigation && self.keymap.list.page_down.is_pressed(key)
                 && !self.filtered_rows.is_empty() => {
                     let step = self.view_rows.unwrap_or(10).max(1);
                     let target = self.selected.saturating_add(step);
@@ -1379,8 +1386,8 @@ impl PickerState {
                 self.request_frame();
             }
             _ if allow_plain_char_navigation
-                && (self.list_keymap.move_left.is_pressed(key)
-                    || self.list_keymap.move_right.is_pressed(key)) =>
+                && (self.keymap.list.move_left.is_pressed(key)
+                    || self.keymap.list.move_right.is_pressed(key)) =>
             {
                 self.change_focused_toolbar_value();
                 self.request_frame();
@@ -2444,7 +2451,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
         SessionListDensity::Dense => "comfy",
     };
     let mut first_row_hints = Vec::new();
-    if let Some(accept) = state.list_keymap.primary_hint(ListAction::Accept) {
+    if let Some(accept) = state.keymap.list.primary_hint(ListAction::Accept) {
         first_row_hints.push(PickerFooterHint {
             key: accept.display_label(),
             wide_label: action_label.to_string(),
@@ -2460,7 +2467,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
             priority: 2,
         });
     }
-    if let Some(cancel) = state.list_keymap.primary_hint(ListAction::Cancel) {
+    if let Some(cancel) = state.keymap.list.primary_hint(ListAction::Cancel) {
         first_row_hints.push(PickerFooterHint {
             key: cancel.display_label(),
             wide_label: esc_label.to_string(),
@@ -2484,7 +2491,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     ]);
     let option_keys = [ListAction::MoveLeft, ListAction::MoveRight]
         .into_iter()
-        .filter_map(|action| state.list_keymap.primary_hint(action))
+        .filter_map(|action| state.keymap.list.primary_hint(action))
         .map(super::key_hint::ShortcutHint::display_label)
         .collect::<Vec<_>>()
         .join("/");
@@ -2518,7 +2525,7 @@ fn footer_hint_lines(state: &PickerState, width: u16) -> Vec<Line<'static>> {
     ];
     let browse_keys = [ListAction::MoveUp, ListAction::MoveDown]
         .into_iter()
-        .filter_map(|action| state.list_keymap.primary_hint(action))
+        .filter_map(|action| state.keymap.list.primary_hint(action))
         .map(super::key_hint::ShortcutHint::display_label)
         .collect::<Vec<_>>()
         .join("/");
@@ -3287,12 +3294,19 @@ fn render_expanded_session_details(
 
     vec![
         expanded_detail_line("Session:", &session, width),
-        expanded_time_detail_line("Created:", reference, row.created_at, width),
+        expanded_time_detail_line(
+            "Created:",
+            reference,
+            row.created_at,
+            width,
+            state.clock_format,
+        ),
         expanded_time_detail_line(
             "Updated:",
             reference,
             row.updated_at.or(row.created_at),
             width,
+            state.clock_format,
         ),
         expanded_detail_line("Directory:", &directory, width),
         expanded_detail_line("Branch:", &branch, width),
@@ -3353,11 +3367,17 @@ fn render_transcript_content_lines(
             conversation_user_style(),
         )],
         TranscriptPreviewSpeaker::Assistant => {
-            let mut lines = render_assistant(&line.text, /*width*/ None, cwd, &|_| false)
-                .lines
-                .into_iter()
-                .map(|line| line.line)
-                .collect::<Vec<_>>();
+            let mut lines = render_assistant(
+                &line.text,
+                /*width*/ None,
+                cwd,
+                &|_| false,
+                crate::markdown_render::ListSpacing::AfterMultiline,
+            )
+            .lines
+            .into_iter()
+            .map(|line| line.line)
+            .collect::<Vec<_>>();
             for line in &mut lines {
                 *line = conversation_content_line(line.clone(), conversation_assistant_style());
             }
@@ -3431,6 +3451,7 @@ fn expanded_time_detail_line(
     reference: DateTime<Utc>,
     ts: Option<DateTime<Utc>>,
     width: u16,
+    clock_format: ClockFormat,
 ) -> Line<'static> {
     let Some(ts) = ts else {
         return expanded_detail_line(label, "-", width);
@@ -3438,12 +3459,12 @@ fn expanded_time_detail_line(
     let value = format!(
         "{} · {}",
         format_relative_time_long(reference, ts),
-        format_timestamp(ts)
+        format_timestamp(ts, clock_format)
     );
     expanded_detail_line(label, &value, width)
 }
 
-fn format_relative_time(reference: DateTime<Utc>, ts: Option<DateTime<Utc>>) -> String {
+pub(crate) fn format_relative_time(reference: DateTime<Utc>, ts: Option<DateTime<Utc>>) -> String {
     let Some(ts) = ts else {
         return "-".to_string();
     };
@@ -3493,8 +3514,12 @@ fn plural_time(value: i64, unit: &str) -> String {
     }
 }
 
-fn format_timestamp(ts: DateTime<Utc>) -> String {
-    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+fn format_timestamp(ts: DateTime<Utc>, clock_format: ClockFormat) -> String {
+    ts.format(match clock_format {
+        ClockFormat::TwelveHour => "%Y-%m-%d %-I:%M:%S %p",
+        ClockFormat::TwentyFourHour => "%Y-%m-%d %H:%M:%S",
+    })
+    .to_string()
 }
 
 fn render_empty_state_line(state: &PickerState) -> Line<'static> {
@@ -4134,6 +4159,7 @@ mod tests {
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
+        state.clock_format = ClockFormat::TwentyFourHour;
         state.relative_time_reference = parse_timestamp_str("2026-05-02T14:48:19Z");
         let row = Row {
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -4542,15 +4568,15 @@ mod tests {
         assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+o dense view"));
         assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+t transcript"));
         assert!(footer_lines_text(&state, /*width*/ 220).contains("ctrl+e expand"));
-        state.list_keymap.move_left = vec![crate::key_hint::ctrl(KeyCode::Char('h'))];
-        state.list_keymap.move_right = vec![crate::key_hint::ctrl(KeyCode::Char('l'))];
+        state.keymap.list.move_left = vec![crate::key_hint::ctrl(KeyCode::Char('h'))];
+        state.keymap.list.move_right = vec![crate::key_hint::ctrl(KeyCode::Char('l'))];
         let remapped_footer = footer_lines_text(&state, /*width*/ 220);
         assert!(
             remapped_footer.contains("ctrl+h/ctrl+l change option"),
             "{remapped_footer}"
         );
-        state.list_keymap.move_left.clear();
-        state.list_keymap.move_right.clear();
+        state.keymap.list.move_left.clear();
+        state.keymap.list.move_right.clear();
         assert!(!footer_lines_text(&state, /*width*/ 220).contains("change option"));
 
         state.density = SessionListDensity::Dense;
@@ -5151,6 +5177,14 @@ mod tests {
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
+        state.keymap = RuntimeKeymap::from_config(
+            &serde_json::from_value(serde_json::json!({
+                "pager": {"scroll_up": ["ctrl-space x", "ctrl-x ctrl-space"]},
+                "editor": {"move_line_start": ["alt-a", "ctrl-x h"]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         state.pending_transcript_open = Some(thread_id);
         let cells: TranscriptCells =
             vec![Arc::new(PlainHistoryCell::new(vec!["transcript".into()]))];
@@ -5175,6 +5209,63 @@ mod tests {
 
         assert!(matches!(state.overlay, Some(Overlay::Transcript(_))));
         assert_eq!(state.pending_transcript_open, None);
+        let select = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_eq!(state.route_key_chord(select), Some(select));
+        assert_eq!(
+            state.route_key_chord(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert!(state.chord_matcher.is_pending());
+        assert_eq!(state.route_key_chord(select), Some(select));
+        assert!(!state.chord_matcher.is_pending());
+        let mut tui = crate::tui::test_support::make_test_tui().expect("tui");
+        state
+            .handle_overlay_event(
+                &mut tui,
+                TuiEvent::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            )
+            .unwrap();
+        state
+            .handle_overlay_event(&mut tui, TuiEvent::Paste("tail".into()))
+            .unwrap();
+        for (keys, insertion) in [
+            (
+                vec![KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)],
+                "A",
+            ),
+            (
+                vec![
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+                ],
+                "B",
+            ),
+        ] {
+            for key in keys {
+                if let Some(key) = state.route_key_chord(key) {
+                    state
+                        .handle_overlay_event(&mut tui, TuiEvent::Key(key))
+                        .unwrap();
+                }
+            }
+            state
+                .handle_overlay_event(&mut tui, TuiEvent::Paste(insertion.into()))
+                .unwrap();
+        }
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 12,
+        );
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let Some(Overlay::Transcript(overlay)) = &mut state.overlay else {
+            panic!("transcript preview");
+        };
+        overlay.render(area, &mut buffer);
+        let text = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("BAtail"), "Find query: {text}");
     }
 
     #[tokio::test]
@@ -5747,6 +5838,7 @@ session_picker_view = "dense"
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
+        state.clock_format = ClockFormat::TwelveHour;
         state.all_rows = vec![row.clone()];
         state.filtered_rows = vec![row];
         state.relative_time_reference =
@@ -6345,10 +6437,10 @@ session_picker_view = "dense"
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
-        state.list_keymap.page_down = vec![crate::key_hint::ctrl(KeyCode::Char('d'))];
-        state.list_keymap.page_up = vec![crate::key_hint::ctrl(KeyCode::Char('u'))];
-        state.list_keymap.jump_bottom = vec![crate::key_hint::ctrl(KeyCode::Char('y'))];
-        state.list_keymap.jump_top = vec![crate::key_hint::ctrl(KeyCode::Char('a'))];
+        state.keymap.list.page_down = vec![crate::key_hint::ctrl(KeyCode::Char('d'))];
+        state.keymap.list.page_up = vec![crate::key_hint::ctrl(KeyCode::Char('u'))];
+        state.keymap.list.jump_bottom = vec![crate::key_hint::ctrl(KeyCode::Char('y'))];
+        state.keymap.list.jump_top = vec![crate::key_hint::ctrl(KeyCode::Char('a'))];
 
         let mut items = Vec::new();
         for idx in 0..20 {
@@ -6407,7 +6499,7 @@ session_picker_view = "dense"
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
-        state.list_keymap.cancel = vec![crate::key_hint::ctrl(KeyCode::Char('c'))];
+        state.keymap.list.cancel = vec![crate::key_hint::ctrl(KeyCode::Char('c'))];
 
         let selection = state
             .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
@@ -6756,7 +6848,7 @@ session_picker_view = "dense"
     }
 
     #[test]
-    fn thread_to_transcript_cells_shows_raw_reasoning_over_summary_when_enabled() {
+    fn thread_to_transcript_cells_retains_summary_and_raw_reasoning_when_enabled() {
         use crate::thread_transcript::thread_to_transcript_cells;
 
         let thread_id = ThreadId::new();
@@ -6819,8 +6911,7 @@ session_picker_view = "dense"
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(rendered.contains("raw reasoning content"));
-        assert!(!rendered.contains("public summary"));
+        assert_eq!(rendered, "• public summary\n  \n  raw reasoning content");
     }
 
     #[tokio::test]

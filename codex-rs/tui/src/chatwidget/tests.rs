@@ -159,9 +159,6 @@ pub(super) use codex_protocol::plan_tool::StepStatus;
 pub(super) use codex_protocol::plan_tool::UpdatePlanArgs;
 pub(super) use codex_protocol::request_permissions::RequestPermissionProfile;
 pub(super) use codex_protocol::user_input::TextElement;
-pub(super) use codex_terminal_detection::Multiplexer;
-pub(super) use codex_terminal_detection::TerminalInfo;
-pub(super) use codex_terminal_detection::TerminalName;
 pub(super) use codex_utils_absolute_path::AbsolutePathBuf;
 pub(super) use codex_utils_approval_presets::builtin_approval_presets;
 pub(super) use codex_utils_path_uri::LegacyAppPathString;
@@ -249,12 +246,18 @@ mod computer_activity_tests;
 mod config_errors;
 #[path = "tests/copy_export_picker_tests.rs"]
 mod copy_export_picker_tests;
+#[path = "tests/dynamic_activity_tests.rs"]
+mod dynamic_activity_tests;
 mod exec_flow;
 mod goal_menu;
 mod goal_validation;
 mod guardian;
 pub(crate) mod helpers;
+#[path = "tests/history_projection.rs"]
+mod history_projection;
 mod history_replay;
+#[path = "tests/home_cleanup_tests.rs"]
+mod home_cleanup_tests;
 #[path = "tests/luna_reserve_usage_tests.rs"]
 mod luna_reserve_usage_tests;
 mod mcp_startup;
@@ -288,9 +291,13 @@ mod side;
 mod slash_commands;
 #[path = "tests/sparkle_submission_tests.rs"]
 mod sparkle_submission_tests;
+#[path = "tests/startup_submission_tests.rs"]
+mod startup_submission_tests;
 mod status_and_layout;
 mod status_command_tests;
 mod status_surface_previews;
+#[path = "tests/subagent_activity_tests.rs"]
+mod subagent_activity;
 mod terminal_title;
 #[path = "tests/tool_activity_tests.rs"]
 mod tool_activity_tests;
@@ -305,6 +312,12 @@ pub(super) use helpers::*;
 
 #[path = "tests/questions_tests.rs"]
 mod questions_tests;
+
+#[path = "tests/question_turn_end_tests.rs"]
+mod question_turn_end_tests;
+
+#[path = "tests/list_spacing_tests.rs"]
+mod list_spacing_tests;
 
 #[path = "tests/question_notifications_tests.rs"]
 mod question_notifications_tests;

@@ -5,6 +5,119 @@ use pretty_assertions::assert_eq;
 use unicode_width::UnicodeWidthStr;
 
 #[test]
+fn stadium_declarations_and_references() {
+    let graph =
+        super::parse::parse("flowchart TD", &["A", "A([Ready?])", "A", "A([Ready?])"]).unwrap();
+    assert_eq!(
+        graph.nodes,
+        vec![super::Node {
+            id: "A".to_owned(),
+            label: "Ready?".to_owned(),
+            shape: super::Shape::Stadium,
+            declared: true,
+            members: Vec::new(),
+        }]
+    );
+}
+
+#[test]
+fn stadiums_with_other_shapes_in_every_direction() {
+    let mut cases = Vec::new();
+    for direction in ["TD", "BT", "LR", "RL"] {
+        let source =
+            format!("flowchart {direction}; A([请求]) --> B[Work] --> C{{Done?}}; C --> A");
+        let output = render(&source, /*max_width*/ 100).unwrap();
+        let width = output.lines().map(UnicodeWidthStr::width).max().unwrap();
+        assert_eq!(render(&source, width), Ok(output.clone()));
+        assert_eq!(render(&source, width - 1), Err(RenderError::TooWide));
+        cases.push(format!("{direction}\n{output}"));
+    }
+    assert_snapshot!(cases.join("\n\n"));
+}
+
+#[test]
+fn quoted_flowchart_labels_match_unquoted_labels() {
+    let quoted = r#"A["Review & confirm"] -->|"Yes & continue"| B{"Ready?"}
+B --> C(["Checkout"])
+A[Review & confirm]"#;
+    let unquoted = quoted.replace('"', "");
+    assert_eq!(
+        super::parse::parse("flowchart TD", &quoted.lines().collect::<Vec<_>>()).unwrap(),
+        super::parse::parse("flowchart TD", &unquoted.lines().collect::<Vec<_>>()).unwrap(),
+    );
+    for (quoted, label) in [
+        (r#"A["(Database)"]"#, "(Database)"),
+        (r#"A["/Input/"]"#, "/Input/"),
+    ] {
+        let graph = super::parse::parse("flowchart TD", &[quoted]).unwrap();
+        assert_eq!(
+            graph.nodes,
+            vec![super::Node {
+                id: "A".to_owned(),
+                label: label.to_owned(),
+                shape: super::Shape::Rectangle,
+                declared: true,
+                members: Vec::new(),
+            }]
+        );
+    }
+}
+
+#[test]
+fn entity_labels_keep_source_fallback() {
+    for entity in ["&amp;", "&#38;", "&#x26;"] {
+        for source in [
+            format!("sequenceDiagram\nA->>B: {entity}"),
+            format!("flowchart TD; A[\"{entity}\"]"),
+            format!("flowchart TD; A -->|\"{entity}\"| B"),
+        ] {
+            assert_eq!(
+                render(&source, /*max_width*/ 100),
+                Err(RenderError::Unsupported),
+                "{source:?}",
+            );
+        }
+    }
+}
+
+#[test]
+fn flowchart_ampersands_preserve_statement_separators() {
+    let source = "flowchart TD; A[R&D] -->|R&D| B[Review & confirm]; B --> C";
+    assert_eq!(
+        render(&format!("%% &amp;\n{source}"), /*max_width*/ 100),
+        render(&source.replace(';', "\n"), /*max_width*/ 100),
+    );
+    assert!(
+        render(source, /*max_width*/ 100)
+            .unwrap()
+            .contains("Review & confirm")
+    );
+}
+
+#[test]
+fn quoted_flowchart_labels_reject_malformed_and_unsafe_text() {
+    for label in [
+        "\"unfinished",
+        "unfinished\"",
+        "\"embedded\"quote\"",
+        "\"\"",
+        "\"<b>HTML</b>\"",
+        "\"\u{1b}\"",
+    ] {
+        for source in [
+            format!("flowchart TD; A[{label}]"),
+            format!("flowchart TD; A -->|{label}| B"),
+        ] {
+            assert_eq!(
+                render(&source, /*max_width*/ 100),
+                Err(RenderError::Unsupported),
+                "{source:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn branches_merges_and_retry_loop() {
     let source = "flowchart TD\nA[Checkout] --> B{In stock?}\nB -->|yes| C[Reserve]\nB -->|no| D[Waitlist]\nC --> E{Paid?}\nE -->|yes| F[Ship]\nE -->|no| G[Retry payment]\nG --> E\nD --> H[Notify buyer]\nF --> H";
     assert_snapshot!(render(source, /*max_width*/ 100).unwrap());
@@ -13,6 +126,17 @@ fn branches_merges_and_retry_loop() {
 #[test]
 fn rejects_partial_or_unsupported_input() {
     for source in [
+        "flowchart TD; P --> Q; A[(Database)]",
+        "flowchart TD; P --> Q; A[/Input/]",
+        r"flowchart TD; P --> Q; A[\Output\]",
+        r"flowchart TD; P --> Q; A[/Trapezoid\]",
+        r"flowchart TD; P --> Q; A[\Inverse/]",
+        "flowchart TD; P --> Q; A[[Subroutine]]",
+        "flowchart TD; P --> Q; A{{Hexagon}}",
+        r#"flowchart TD; P --> Q; A["`hello **world**`"]"#,
+        r#"flowchart TD; P --> Q; A{"`Decision`"}"#,
+        r#"flowchart TD; P --> Q; A(["`Stadium`"])"#,
+        r#"flowchart TD; P --> Q; A -->|"`Caption`"| B"#,
         "flowchart TD; subgraph X; A; end",
         "flowchart TD; A --> B; garbage syntax",
         "flowchart TD; A -.-> B",
@@ -31,8 +155,16 @@ fn rejects_partial_or_unsupported_input() {
         "flowchart TD; A[unclosed",
         "flowchart TD; click A",
         "flowchart TD; A((circle))",
+        "flowchart TD; A(rounded)",
+        "flowchart TD; A([unclosed]",
+        "flowchart TD; A([unclosed)",
+        "flowchart TD; A([label]) trailing",
+        "flowchart TD; A([])",
+        "flowchart TD; A([nested[label]])",
+        "flowchart TD; A([one]); A([two])",
+        "flowchart TD; A([same]); A[same]",
+        "flowchart TD; A{same}; A([same])",
         "flowchart TD; A -->|unclosed B",
-        "flowchart TD; A[\"quoted\"]",
         "flowchart TD; A[foo;bar]",
         "flowchart TD; A[لا]",
         "flowchart TD; A -->|yes┐| B",
@@ -50,6 +182,7 @@ fn source_graph_and_width_limits() {
     for source in [
         " ".repeat(16 * 1024 + 1),
         format!("graph TD; A[{}]", "x".repeat(41)),
+        format!("graph TD; A([{}])", "x".repeat(41)),
         format!(
             "graph TD; {}",
             (0..17).map(|n| format!("N{n};")).collect::<String>()
