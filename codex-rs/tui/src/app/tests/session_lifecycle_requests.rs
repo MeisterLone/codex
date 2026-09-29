@@ -1123,6 +1123,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         .request_typed(ClientRequest::McpServerStatusList {
             request_id: AppServerRequestId::String("tui-tool-inventory".to_string()),
             params: codex_app_server_protocol::ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(codex_app_server_protocol::McpServerStatusDetail::ToolsAndAuthOnly),
@@ -2660,7 +2661,6 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
             /*is_first_event*/ false,
             Some("This is a test announcement".to_string()),
             /*auth_plan*/ None,
-            /*show_fast_status*/ false,
         )),
     );
     app.enqueue_primary_thread_session(started.session, started.turns)
@@ -2917,7 +2917,7 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
         ),
         (
             HistoryCapabilities::ThreadListFails,
-            vec!["recency_at", "recency_at", "recency_at", "recency_at"],
+            vec!["recency_at", "recency_at"],
         ),
     ] {
         let (mut app, _codex_home) = make_history_test_app().await?;
@@ -2959,9 +2959,10 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
                     .collect::<Vec<_>>(),
                 vec![started.session.thread_id]
             );
+            assert!(app.agents_overview.initialized);
             assert_eq!(
-                app.agents_overview.initialized,
-                capabilities != HistoryCapabilities::ThreadListFails || attempt > 0
+                app.agents_overview.discovery.has_more(),
+                capabilities == HistoryCapabilities::ThreadListFails
             );
             if attempt == 0 {
                 app.handle_app_server_event(
@@ -4369,7 +4370,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                         .replace(&child_thread_id.to_string(), "[child]"),
                     @r###"
                       Subagents
-                      Select an agent to watch. ⌥+← previous, ⌥+→ next.
+                      Select an agent to watch. ⌥← previous, ⌥→ next.
 
 
                     › 1. • Main [default] (current)  [root]

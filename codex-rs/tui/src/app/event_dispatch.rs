@@ -574,7 +574,7 @@ impl App {
                             {
                                 Ok(()) => {
                                     // Keep local input without replacing the fork's running state.
-                                    self.chat_widget.restore_reconnected_input(retained_input);
+                                    self.chat_widget.restore_reconnected_input(retained_input, &[]);
                                     if let Some(err) = name_error {
                                         self.chat_widget.add_error_message(err);
                                     }
@@ -2598,6 +2598,7 @@ impl App {
                 }
             }
             AppEvent::OpenAgentsOverview => self.open_agents_overview(app_server),
+            AppEvent::ShowMoreAgentsOverview => self.show_more_agents_overview(app_server),
             AppEvent::NewAgentsOverviewSession { cwd } => {
                 return Box::pin(self.new_agents_overview_session(tui, app_server, cwd)).await;
             }

@@ -3557,6 +3557,7 @@ dependencies = [
  "codex-model-provider-info",
  "codex-prompts",
  "codex-protocol",
+ "codex-utils-cargo-bin",
  "core_test_support",
  "dirs",
  "http 1.4.0",
@@ -3567,6 +3568,8 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wiremock",
+ "zstd",
 ]
 
 [[package]]
@@ -8475,9 +8478,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.16"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
