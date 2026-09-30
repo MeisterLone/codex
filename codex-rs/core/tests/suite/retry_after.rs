@@ -644,14 +644,11 @@ async fn cyber_policy_response_uses_persistent_backoff() -> Result<()> {
     let response_mock = responses::mount_response_sequence(
         &server,
         vec![
-            ResponseTemplate::new(400).set_body_json(json!({
-                "error": {
-                    "message": "This request has been flagged for potentially high-risk cyber activity.",
-                    "type": "invalid_request",
-                    "param": null,
-                    "code": "cyber_policy"
-                }
-            })),
+            responses::sse_response(responses::sse_failed(
+                "blocked-response",
+                "cyber_policy",
+                "This request has been flagged for potentially high-risk cyber activity.",
+            )),
             responses::sse_response(responses::sse(vec![
                 responses::ev_response_created("recovered"),
                 responses::ev_completed("recovered"),
@@ -692,6 +689,78 @@ async fn cyber_policy_response_uses_persistent_backoff() -> Result<()> {
     assert_eq!(
         stream_error.additional_details.as_deref(),
         Some("This request has been flagged for potentially high-risk cyber activity.")
+    );
+    wait_for_retry(&mut telemetry, &retry).await;
+    wait_for_turn_completion(&test).await;
+
+    assert_eq!(response_mock.requests().len(), 2);
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+
+    Ok(())
+}
+
+/// Content-filter responses use recovery guidance without consuming the finite stream budget.
+#[tokio::test(flavor = "current_thread")]
+async fn content_filter_response_uses_persistent_backoff() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut telemetry = RetryTelemetryCapture::install();
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("blocked-response"),
+                json!({
+                    "type": "response.incomplete",
+                    "response": {"incomplete_details": {"reason": "content_filter"}}
+                }),
+            ])),
+            responses::sse_response(responses::sse(vec![
+                responses::ev_response_created("recovered"),
+                responses::ev_completed("recovered"),
+            ])),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    submit_user_input(&test, "retry with content-filter recovery guidance").await?;
+    let retry = telemetry.next_retry().await;
+    assert_eq!(
+        retry,
+        RetryTelemetryEvent {
+            attempt: 1,
+            delay: Duration::from_secs(5),
+            layer: "stream".into(),
+            operation: "sampling".into(),
+        }
+    );
+    let EventMsg::StreamError(stream_error) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::StreamError(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(
+        stream_error.message,
+        "Response was blocked by a content filter. Retrying with recovery guidance"
+    );
+    assert!(
+        stream_error
+            .additional_details
+            .as_deref()
+            .is_some_and(|details| details.contains("content_filter"))
     );
     wait_for_retry(&mut telemetry, &retry).await;
     wait_for_turn_completion(&test).await;
@@ -1964,6 +2033,88 @@ async fn websocket_upgrade_rejection_uses_retry_after() -> Result<()> {
         .collect::<Vec<_>>();
     assert_eq!(methods, vec!["GET", "GET", "GET", "POST", "POST"]);
     assert_eq!(response_mock.requests().len(), 2);
+
+    Ok(())
+}
+
+/// Wrapped websocket overloads use the persistent backoff and reconnect.
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_overload_uses_persistent_backoff() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut telemetry = RetryTelemetryCapture::install();
+    let server = responses::start_websocket_server(vec![
+        vec![
+            vec![
+                responses::ev_response_created("prewarm"),
+                responses::ev_completed("prewarm"),
+            ],
+            vec![json!({
+                "type": "error",
+                "status": 503,
+                "error": {
+                    "code": "server_is_overloaded",
+                    "message": "This model is overloaded."
+                }
+            })],
+        ],
+        vec![vec![
+            responses::ev_response_created("recovered"),
+            responses::ev_completed("recovered"),
+        ]],
+    ])
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_websocket_server(&server)
+        .await?;
+
+    let warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
+    submit_user_input(&test, "recover from the websocket overload").await?;
+    let retry = telemetry.next_retry().await;
+    assert_eq!(
+        retry,
+        RetryTelemetryEvent {
+            attempt: 1,
+            delay: Duration::from_secs(5),
+            layer: "stream".into(),
+            operation: "sampling".into(),
+        }
+    );
+    let EventMsg::StreamError(stream_error) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::StreamError(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a stream error event");
+    };
+    assert_eq!(
+        stream_error.message,
+        "Selected model is at capacity. Retrying with backoff"
+    );
+    assert_eq!(
+        stream_error.codex_error_info,
+        Some(CodexErrorInfo::ServerOverloaded)
+    );
+    wait_for_retry(&mut telemetry, &retry).await;
+    wait_for_turn_completion(&test).await;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    let request_count: usize = connections.iter().map(Vec::len).sum();
+    assert_eq!(request_count, 3);
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+    server.shutdown().await;
+
     Ok(())
 }
 

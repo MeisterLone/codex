@@ -75,6 +75,7 @@ pub(crate) fn uses_unbounded_response_retries(
         && (matches!(
             err.details(),
             CodexErrorDetails::ConnectionFailed(_)
+                | CodexErrorDetails::ContentFilter
                 | CodexErrorDetails::ServerOverloaded
                 | CodexErrorDetails::CyberPolicy { .. }
         ) || is_transient_chatgpt_model_error(err))
@@ -120,6 +121,8 @@ pub(crate) async fn handle_response_stream_error(
         let retry_delay = retry_state.unbounded_retry_delay;
         let retry_status = if matches!(err.details(), CodexErrorDetails::ServerOverloaded) {
             "Selected model is at capacity. Retrying with backoff"
+        } else if matches!(err.details(), CodexErrorDetails::ContentFilter) {
+            "Response was blocked by a content filter. Retrying with recovery guidance"
         } else if matches!(err.details(), CodexErrorDetails::CyberPolicy { .. }) {
             "Request was temporarily blocked by cybersecurity policy. Retrying with backoff"
         } else if is_transient_chatgpt_model_error(&err) {

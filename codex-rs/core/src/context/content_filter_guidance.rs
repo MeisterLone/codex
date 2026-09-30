@@ -1,4 +1,4 @@
-//! Bounded recovery guidance for a response blocked by an unspecified content filter.
+//! Recovery guidance for a response blocked by an unspecified content filter.
 
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
