@@ -1,4 +1,5 @@
-//! Environment attachment authority, including the shared Full Access decision.
+//! Environment requests, thread selections, and attachment authority.
+//! Input APIs accept requests; runtime code uses selections constructed by the thread.
 
 use crate::capabilities::SelectedCapabilityRoot;
 use crate::config_types::ShellEnvironmentPolicy;
@@ -7,9 +8,120 @@ use crate::mcp_policy::EnvironmentMcpPolicy;
 use crate::models::PermissionProfile;
 use crate::models::PermissionProfileSnapshot;
 use crate::protocol::AskForApproval;
+use crate::sandbox::SandboxType;
 use codex_execpolicy::RequirementsExecPolicy;
 use codex_network_proxy::EnvironmentNetworkPolicy;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+
+/// An environment requested by a caller, before construction of thread-owned state.
+///
+/// Input APIs accept requests so the receiving thread has a construction boundary for
+/// attaching its state before passing a selection to runtime code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnEnvironmentRequest {
+    pub environment_id: String,
+    pub cwd: PathUri,
+    pub workspace_roots: Vec<PathUri>,
+    pub config: EnvironmentConfigState,
+}
+
+/// An environment selected by a thread for runtime use.
+/// Constructed from caller input at the receiving thread's startup or settings boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnEnvironmentSelection {
+    pub environment_id: String,
+    pub cwd: PathUri,
+    pub workspace_roots: Vec<PathUri>,
+    pub config: EnvironmentConfigState,
+}
+
+impl TurnEnvironmentSelection {
+    /// Constructs runtime state at the receiving thread boundary.
+    pub fn new(request: TurnEnvironmentRequest) -> Self {
+        Self {
+            environment_id: request.environment_id,
+            cwd: request.cwd,
+            workspace_roots: request.workspace_roots,
+            config: request.config,
+        }
+    }
+
+    /// Requests this environment again; the receiving thread supplies its own roots.
+    /// This explicit conversion discards thread-owned state. Test inputs should instead
+    /// construct requests directly so they do not depend on runtime selection fields.
+    pub fn into_request(self) -> TurnEnvironmentRequest {
+        TurnEnvironmentRequest {
+            environment_id: self.environment_id,
+            cwd: self.cwd,
+            workspace_roots: self.workspace_roots,
+            config: self.config,
+        }
+    }
+}
+
+/// The environments captured by a thread and its fallback working directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnEnvironmentSelections {
+    pub legacy_fallback_cwd: AbsolutePathBuf,
+    pub environments: Vec<TurnEnvironmentSelection>,
+}
+
+impl TurnEnvironmentSelections {
+    pub fn new(
+        legacy_fallback_cwd: AbsolutePathBuf,
+        environments: Vec<TurnEnvironmentSelection>,
+    ) -> Self {
+        Self {
+            legacy_fallback_cwd,
+            environments,
+        }
+    }
+
+    /// Requests these environments again, leaving root choices to the receiving thread.
+    pub fn into_requests(self) -> TurnEnvironmentRequests {
+        TurnEnvironmentRequests {
+            legacy_fallback_cwd: self.legacy_fallback_cwd,
+            environment_requests: self
+                .environments
+                .into_iter()
+                .map(TurnEnvironmentSelection::into_request)
+                .collect(),
+        }
+    }
+}
+
+/// Environment input supplied together with its fallback working directory.
+/// The receiving thread constructs selections before capturing these environments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnEnvironmentRequests {
+    pub legacy_fallback_cwd: AbsolutePathBuf,
+    pub environment_requests: Vec<TurnEnvironmentRequest>,
+}
+
+impl TurnEnvironmentRequests {
+    pub fn new(
+        legacy_fallback_cwd: AbsolutePathBuf,
+        environment_requests: Vec<TurnEnvironmentRequest>,
+    ) -> Self {
+        Self {
+            legacy_fallback_cwd,
+            environment_requests,
+        }
+    }
+
+    /// Constructs the selections captured by the receiving thread.
+    pub fn select(self) -> TurnEnvironmentSelections {
+        TurnEnvironmentSelections {
+            legacy_fallback_cwd: self.legacy_fallback_cwd,
+            environments: self
+                .environment_requests
+                .into_iter()
+                .map(TurnEnvironmentSelection::new)
+                .collect(),
+        }
+    }
+}
 
 /// Configuration supplied for a thread's selected environment.
 #[allow(clippy::large_enum_variant)]
@@ -64,10 +176,10 @@ pub struct EnvironmentConfig {
     pub permission_profile: PermissionProfileSnapshot,
     /// Controls which environment variables shell commands may inherit.
     pub shell_environment_policy: ShellEnvironmentPolicy,
-    /// Windows sandbox implementation for this environment attachment.
+    /// Legacy Windows restricted-token setup level for this environment attachment.
     pub windows_sandbox_level: WindowsSandboxLevel,
-    /// Whether Windows sandbox processes use a private desktop.
-    pub windows_sandbox_private_desktop: bool,
+    /// Concrete Windows sandbox backend selected for this environment attachment.
+    pub windows_sandbox_type: SandboxType,
     /// Whether Linux sandbox processes use the legacy Landlock backend.
     pub use_legacy_landlock: bool,
     /// Additional managed command restrictions for this environment attachment.
@@ -89,10 +201,7 @@ impl std::fmt::Debug for EnvironmentConfig {
             .field("permission_profile", &self.permission_profile)
             .field("shell_environment_policy", &"<redacted>")
             .field("windows_sandbox_level", &self.windows_sandbox_level)
-            .field(
-                "windows_sandbox_private_desktop",
-                &self.windows_sandbox_private_desktop,
-            )
+            .field("windows_sandbox_type", &self.windows_sandbox_type)
             .field("use_legacy_landlock", &self.use_legacy_landlock)
             .field("exec_policy", &self.exec_policy)
             .field("mcp_policy", &self.mcp_policy)

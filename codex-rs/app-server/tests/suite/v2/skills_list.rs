@@ -713,7 +713,10 @@ async fn config_reads_complete_alongside_skills_list_request() -> Result<()> {
     assert!(config.layers.is_none());
     assert_eq!(
         requirements,
-        ConfigRequirementsReadResponse { requirements: None }
+        ConfigRequirementsReadResponse {
+            supports_independent_speed_modes: Some(true),
+            requirements: None,
+        }
     );
     assert!(!permission_profiles.data.is_empty());
 
@@ -1393,6 +1396,7 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
             session_start_source: None,
             thread_source: None,
             project_id: None,
+            daybreak_enabled: None,
             dynamic_tools: None,
             environments: None,
             selected_capability_roots: None,

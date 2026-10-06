@@ -59,11 +59,13 @@ async fn credentials_stay_out_of_persisted_and_feedback_logs() -> Result<()> {
     let initial_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("initial@example.com")
+            .chatgpt_user_id("logging-user")
             .chatgpt_account_id(account_id),
     )?;
     let refreshed_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("refreshed@example.com")
+            .chatgpt_user_id("logging-user")
             .chatgpt_account_id(account_id),
     )?;
     let server = MockServer::start().await;
@@ -623,7 +625,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
     .await??;
 
     let mut tool_call = app_server
-        .wait_for_json_log_event("codex.tool_call")
+        .wait_for_json_log_event("codex.tool_call", Duration::from_secs(/*secs*/ 10))
         .await?;
     let tool_call_object = tool_call
         .as_object_mut()

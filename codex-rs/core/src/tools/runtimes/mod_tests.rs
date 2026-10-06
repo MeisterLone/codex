@@ -76,8 +76,11 @@ pub(super) async fn test_credential_broker_network_proxy() -> anyhow::Result<Net
 async fn test_network_proxy_with_config(
     config: NetworkProxyConfig,
 ) -> anyhow::Result<NetworkProxy> {
-    let state =
-        codex_network_proxy::build_config_state(config, NetworkProxyConstraints::default())?;
+    let state = codex_network_proxy::build_config_state(
+        config,
+        NetworkProxyConstraints::default(),
+        codex_utils_path_uri::Platform::native(),
+    )?;
     NetworkProxy::builder()
         .state(Arc::new(NetworkProxyState::with_reloader(
             state,
@@ -124,10 +127,10 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
         workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
-        codex_linux_sandbox_exe: None,
+        sandbox_exe: None,
         use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         network_denial_cancellation_token: None,
         network_proxy: None,
     };
@@ -1296,7 +1299,7 @@ async fn snapshot_wrapper_replays_dummy_and_preserves_unbrokered_credentials() -
         let system_startup_dir = dir.path().join("system-startup");
         std::fs::create_dir(&system_startup_dir)?;
         let system_startup_zsh = system_startup_dir.join("zsh");
-        std::fs::write(
+        codex_utils_cargo_bin::write_executable(
             &system_startup_zsh,
             "#!/bin/sh\nexport OPENAI_API_KEY='sk-system-startup-secret'\nexport AUTH_HEADER='Bearer sk-system-startup-secret'\nexec /bin/zsh -ax \"$@\"\n",
         )?;

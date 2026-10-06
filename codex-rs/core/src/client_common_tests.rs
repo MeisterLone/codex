@@ -6,6 +6,7 @@ use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 use serde_json::value::RawValue;
 use std::sync::Arc;
@@ -27,7 +28,9 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
                         text: "Describe this image.".to_string(),
                     },
                     ContentItem::InputImage {
-                        image_url: "https://example.com/image.png".to_string(),
+                        image: ImageReference::Inline {
+                            image_url: "https://example.com/image.png".to_string(),
+                        },
                         detail,
                     },
                 ],
@@ -41,7 +44,9 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
                 namespace: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,function".to_string(),
+                        image: ImageReference::Inline {
+                            image_url: "data:image/png;base64,function".to_string(),
+                        },
                         detail,
                     },
                 ]),
@@ -53,7 +58,9 @@ fn prompt_with_image_outputs(detail: Option<ImageDetail>) -> Prompt {
                 name: None,
                 output: FunctionCallOutputPayload::from_content_items(vec![
                     FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,custom".to_string(),
+                        image: ImageReference::Inline {
+                            image_url: "data:image/png;base64,custom".to_string(),
+                        },
                         detail,
                     },
                 ]),
@@ -105,7 +112,6 @@ fn serializes_text_verbosity_when_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -153,7 +159,6 @@ fn serializes_text_schema_with_strict_format() {
 
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -215,7 +220,6 @@ fn omits_text_when_not_set() {
     let input: Vec<ResponseItem> = vec![];
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input,
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
@@ -240,7 +244,6 @@ fn omits_text_when_not_set() {
 fn serializes_flex_service_tier_when_set() {
     let req = ResponsesApiRequest {
         model: "gpt-5.4".to_string(),
-        instructions: "i".to_string(),
         input: vec![],
         tools: Some(empty_tools().into()),
         tool_choice: "auto".to_string(),
