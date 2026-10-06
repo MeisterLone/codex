@@ -20,8 +20,8 @@ use codex_protocol::protocol::WarningEvent;
 use tokio::time::Instant;
 use tracing::warn;
 
-const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const INITIAL_UNBOUNDED_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_UNBOUNDED_RETRY_DELAY: Duration = Duration::from_secs(60);
 const CHATGPT_MODEL_NOT_SUPPORTED_ERROR_FRAGMENT: &str =
     "model is not supported when using Codex with a ChatGPT account.";
 
@@ -33,16 +33,16 @@ pub(crate) enum ResponsesStreamRequest {
 
 pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
-    connection_retries: u64,
-    connection_retry_delay: Duration,
+    unbounded_retries: u64,
+    unbounded_retry_delay: Duration,
 }
 
 impl Default for ResponsesStreamRetryState {
     fn default() -> Self {
         Self {
             retries: 0,
-            connection_retries: 0,
-            connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+            unbounded_retries: 0,
+            unbounded_retry_delay: INITIAL_UNBOUNDED_RETRY_DELAY,
         }
     }
 }
@@ -74,7 +74,10 @@ pub(crate) fn uses_unbounded_response_retries(
         && matches!(request, ResponsesStreamRequest::Sampling)
         && (matches!(
             err.details(),
-            CodexErrorDetails::ConnectionFailed(_) | CodexErrorDetails::ServerOverloaded
+            CodexErrorDetails::ConnectionFailed(_)
+                | CodexErrorDetails::ContentFilter
+                | CodexErrorDetails::ServerOverloaded
+                | CodexErrorDetails::CyberPolicy { .. }
         ) || is_transient_chatgpt_model_error(err))
         && !turn_context.session_source.is_internal()
         && !turn_context.provider.info().is_amazon_bedrock()
@@ -112,13 +115,16 @@ pub(crate) async fn handle_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
-
     if uses_unbounded_response_retries(turn_context, request, &err) {
         // Deliberately bypass `max_retries`: keep retrying until sampling succeeds or
         // the caller cancels the turn. Only the delay is capped, not the attempt count.
-        let retry_delay = retry_state.connection_retry_delay;
+        let retry_delay = retry_state.unbounded_retry_delay;
         let retry_status = if matches!(err.details(), CodexErrorDetails::ServerOverloaded) {
             "Selected model is at capacity. Retrying with backoff"
+        } else if matches!(err.details(), CodexErrorDetails::ContentFilter) {
+            "Response was blocked by a content filter. Retrying with recovery guidance"
+        } else if matches!(err.details(), CodexErrorDetails::CyberPolicy { .. }) {
+            "Request was temporarily blocked by cybersecurity policy. Retrying with backoff"
         } else if is_transient_chatgpt_model_error(&err) {
             "Selected model is temporarily unavailable for this ChatGPT account. Retrying with backoff"
         } else {
@@ -132,12 +138,11 @@ pub(crate) async fn handle_response_stream_error(
         );
         sess.notify_stream_error(turn_context, retry_status, err)
             .await;
-        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
-        codex_client::record_retry!(retry_state.connection_retries, retry_delay, operation);
+        retry_state.unbounded_retries = retry_state.unbounded_retries.saturating_add(1);
+        codex_client::record_retry!(retry_state.unbounded_retries, retry_delay, operation);
         tokio::time::sleep(retry_delay).await;
-        retry_state.connection_retry_delay = retry_delay
-            .saturating_mul(2)
-            .min(MAX_CONNECTION_RETRY_DELAY);
+        retry_state.unbounded_retry_delay =
+            retry_delay.saturating_mul(2).min(MAX_UNBOUNDED_RETRY_DELAY);
         return Ok(());
     }
 
